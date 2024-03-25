@@ -1,0 +1,191 @@
+trigger:
+  - None
+
+parameters:
+  - name: env
+    displayName: The Environment to deploy\
+    type: string
+    values: 
+      - test
+      - dev
+      - stage
+      - prod
+  - name: action
+    displayName: Terraform Apply or Destroy
+    type: string
+    values: 
+      - Apply
+      - Destroy
+  - name: resource
+    displayName: Provide the Terraform resources folder
+    type: string
+    values:
+      - 1-Hub-And-Spoke
+      - 2-VM-Deployment
+variables:
+  - template: pipeline-variables.yaml
+
+pool:
+  vmImage: 'windows-latest'
+  
+name: ${{ parameters.resource }} Deployment in Azure
+appendCommitMessageToRunName: false
+stages:
+  #Build Stage
+- stage: BuildStage
+  displayName: Build stage
+  jobs:
+    - job: Build
+      displayName: Build Job
+      steps:
+        - task: PowerShell@2
+          displayName: Displaying TF Vars file\
+          inputs: 
+            targetType: 'inline'
+            script: |
+              Write-Host "Displaying TF Vars file"
+              Get-Content -Path $(Build.SourcesDirectory)/${{ parameters.resource }}/terraform.tfvars
+        - task: TeraformInstaller@0
+          displayName: Teraform TeraformInstall
+          inputs:
+            terraformVersion: $(teraformversion)
+        - task: TerraformCLI@0
+          displayName: Teraform Init
+          inputs:
+            command: 'init'
+            backendType: 'azurerm'
+            workingDirectory: $(Build.SourcesDirectory)/${{ parameters.resource }}/
+            backendServiceArm: #Create a Service Connection from Azure DevOps to Azure Subscription and mention the Name here.
+            backendAzureRmResourceGroupName: #Resource group Name of the backend storage account
+            backendAzureRmStorageAccountName: #Name of the Storage account
+            backendAzureRmContainerName: #Name of the container in storage account
+            backendAzureRmKey: #Name of the tf state file
+        - task: CmdLine@2
+          displayName: Terraform Validate
+          inputs:
+            script: 'terraform validate'
+            workingDirectory: $(Build.SourcesDirectory)/${{ parameters.resource }}/
+        - task: TerraformCLI@2
+          displayName: Terraform Plan
+          inputs:
+            command: plan
+            workingDirectory: $(Build.SourcesDirectory)/${{ parameters.resource }}/
+            publishPlanResults: ${{ parameters.resource }}
+            environmentServiceName: #Create a Service Connection from Azure DevOps to Azure Subscription and mention the Name here.
+            commandOptions: '-var-file=$(Build.SourcesDirectory)/${{ parameters.resource }}/terraform.tfvars -out=tfplan -lock=false'
+        - task: CopyFiles@2
+          displayName: Copying files to Staging Directory
+          inputs:
+            SourceFolder: $(Build.SourcesDirectory)/${{ parameters.resource }}/
+            Contents: |
+              **.tfvars
+              **.tf
+              tfplan
+            TargetFolder: $(Build.ArtifactStagingDirectory)/${{ parameters.resource }}/
+            CleanTargetFolder: true
+            OverWrite: true
+        - task: PublishBuildArtifacts@1
+          displayName: Publish Artifacts in Pipeline
+          inputs:
+            PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+            ArtifactName: ${{ parameters.resource }}
+            publishLocation: 'Container'
+- stage: ManualValidation
+  displayName: Manual Validation
+  condition: eq(dependencies.Build.result, 'Succeeded')
+  dependsOn: Build
+  jobs:
+    - job: Wait_For_User_Confirmation
+      displayName: Wait for User Confirmation 
+      pool: Server
+      timeoutInMinutes: 60
+      steps:
+        - task: ManualValidation@0
+          displayName: ManualValidation
+          timeoutInMinutes: 60
+          inputs:
+            notifyUsers:|
+              #Provide all the Users Email ID as given below,
+              #abc@gmail.com
+              #def@gmail.com
+          instructions: 'Please Verify the Terraform plan and Approve / Reject'
+- stage: Deploy
+  displayName: Deploy the Resources
+  condition: and(succeeded(), eq(dependencies.Build.result, 'Succeeded'), ${{ parameters.action, 'Apply' }})
+  dependsOn: ManualValidation
+  jobs:
+    - job: Deploy
+      displayName: Deploy the Resources
+      steps:
+        - task: DownloadBuildArtifacts@1
+          displayName: Downlaod Build Artifacts
+          inputs:
+            buildType: 'current'
+            downloadType: 'single'
+            artifactName: ${{ parameters.resource }}
+            downloadPath: $(Pipeline.workspace)/${{ parameters.resource }}
+            cleanDestinationFolder: true
+        - task: TeraformInstaller@0
+          displayName: Teraform TeraformInstall
+          inputs:
+            terraformVersion: $(teraformversion)
+        - task: TerraformCLI@0
+          displayName: Teraform Init
+          inputs:
+            command: 'init'
+            backendType: 'azurerm'
+            workingDirectory: $(Build.SourcesDirectory)/${{ parameters.resource }}/
+            backendServiceArm: #Create a Service Connection from Azure DevOps to Azure Subscription and mention the Name here.
+            backendAzureRmResourceGroupName: #Resource group Name of the backend storage account
+            backendAzureRmStorageAccountName: #Name of the Storage account
+            backendAzureRmContainerName: #Name of the container in storage account
+            backendAzureRmKey: #Name of the tf state file
+        - task: TerraformCLI@0
+          displayName: Terraform Apply
+          inputs:
+            command: 'apply'
+            workingDirectory: $(Pipeline.workspace)/${{ parameters.resource }}
+            environmentServiceName: #Name of the Service Connection
+            providerAzureRmSubscriptionId: #Subscription ID where the resources to be created
+            commandOptions: '-auto-approve tfplan'
+            allowTelemetryCollection: true
+- stage: Destroy
+  displayName: Destroy the Resources
+  condition: and(succeeded(), eq(dependencies.Build.result, 'Succeeded'), ${{ parameters.action, 'Destroy' }})
+  dependsOn: ManualValidation
+  jobs:
+    - job: Destroy
+      displayName: Destroy the Resources
+      steps:
+        - task: DownloadBuildArtifacts@1
+          displayName: Downlaod Build Artifacts
+          inputs:
+            buildType: 'current'
+            downloadType: 'single'
+            artifactName: ${{ parameters.resource }}
+            downloadPath: $(Pipeline.workspace)/${{ parameters.resource }}
+            cleanDestinationFolder: true
+        - task: TeraformInstaller@0
+          displayName: Teraform TeraformInstall
+          inputs:
+            terraformVersion: $(teraformversion)
+        - task: TerraformCLI@0
+          displayName: Teraform Init
+          inputs:
+            command: 'init'
+            backendType: 'azurerm'
+            workingDirectory: $(Build.SourcesDirectory)/${{ parameters.resource }}/
+            backendServiceArm: #Create a Service Connection from Azure DevOps to Azure Subscription and mention the Name here.
+            backendAzureRmResourceGroupName: #Resource group Name of the backend storage account
+            backendAzureRmStorageAccountName: #Name of the Storage account
+            backendAzureRmContainerName: #Name of the container in storage account
+            backendAzureRmKey: #Name of the tf state file
+        - task: TerraformCLI@0
+          displayName: Terraform Destroy
+          inputs:
+            command: 'apply'
+            workingDirectory: $(Pipeline.workspace)/${{ parameters.resource }}
+            environmentServiceName: #Name of the Service Connection
+            providerAzureRmSubscriptionId: #Subscription ID where the resources to be created
+            commandOptions: '-destroy -var-file=$(Pipeline.workspace)/${{ parameters.resource }}/terraform.tfvars'
+            allowTelemetryCollection: true
